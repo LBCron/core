@@ -373,6 +373,84 @@ const getSchematicComponentForSourceComponent = ({
     ...(schematicSheetId ? { schematic_sheet_id: schematicSheetId } : {}),
   })
 
+function getGroupSubtreeSchematicComponents({
+  treeNode,
+  db,
+  schematicSheetId,
+}: {
+  treeNode: CircuitJsonTreeNode
+  db: CircuitJsonUtilObjects
+  schematicSheetId?: SchematicSheetId
+}): SchematicComponent[] {
+  const components: SchematicComponent[] = []
+  const seenIds = new Set<string>()
+  const pushComponent = (comp: SchematicComponent | null | undefined) => {
+    if (!comp || seenIds.has(comp.schematic_component_id)) return
+    if (schematicSheetId && comp.schematic_sheet_id !== schematicSheetId) {
+      return
+    }
+    seenIds.add(comp.schematic_component_id)
+    components.push(comp)
+  }
+
+  const visit = (node: CircuitJsonTreeNode) => {
+    if (node.nodeType === "component" && node.sourceComponent) {
+      pushComponent(
+        getSchematicComponentForSourceComponent({
+          db,
+          sourceComponentId: node.sourceComponent.source_component_id,
+          schematicSheetId,
+        }),
+      )
+      return
+    }
+
+    if (node.nodeType === "group" && node.sourceGroup) {
+      const collapsedBoxComponent = db.schematic_component.getWhere({
+        source_group_id: node.sourceGroup.source_group_id,
+        is_schematic_group: true,
+        ...(schematicSheetId ? { schematic_sheet_id: schematicSheetId } : {}),
+      } as any)
+      if (collapsedBoxComponent) {
+        pushComponent(collapsedBoxComponent)
+        return
+      }
+
+      const nodeSchematicGroup = db.schematic_group?.getWhere?.({
+        source_group_id: node.sourceGroup.source_group_id,
+      })
+      if (nodeSchematicGroup) {
+        for (const directComp of db.schematic_component.list({
+          schematic_group_id: nodeSchematicGroup.schematic_group_id,
+        })) {
+          pushComponent(directComp)
+        }
+      }
+
+      for (const childNode of node.childNodes) {
+        visit(childNode)
+      }
+    }
+  }
+
+  visit(treeNode)
+  return components
+}
+
+function getDescendantGroupSourceIds(treeNode: CircuitJsonTreeNode): string[] {
+  const ids: string[] = []
+  const visit = (nodes: CircuitJsonTreeNode[]) => {
+    for (const node of nodes) {
+      if (node.nodeType === "group" && node.sourceGroup) {
+        ids.push(node.sourceGroup.source_group_id)
+        visit(node.childNodes)
+      }
+    }
+  }
+  visit(treeNode.childNodes)
+  return ids
+}
+
 function convertTreeToMatchPackInputProblem(
   tree: CircuitJsonTreeNode,
   db: CircuitJsonUtilObjects,
@@ -535,8 +613,10 @@ function convertTreeToMatchPackInputProblem(
       if (schematicGroup) {
         debug(`[${group.name}] Treating group ${groupId} as composite chip`)
 
-        const groupComponents = db.schematic_component.list({
-          schematic_group_id: schematicGroup.schematic_group_id,
+        const groupComponents = getGroupSubtreeSchematicComponents({
+          treeNode: child,
+          db,
+          schematicSheetId: opts.schematicSheetId,
         })
 
         debug(
@@ -622,8 +702,10 @@ function convertTreeToMatchPackInputProblem(
         })
 
         if (schematicGroup) {
-          const groupComponents = db.schematic_component.list({
-            schematic_group_id: schematicGroup.schematic_group_id,
+          const groupComponents = getGroupSubtreeSchematicComponents({
+            treeNode,
+            db,
+            schematicSheetId: opts.schematicSheetId,
           })
 
           for (const comp of groupComponents) {
@@ -1082,8 +1164,10 @@ export function applySchematicMatchPackLayoutToTree<
           `Moving group ${chipId} to (${newCenter.x}, ${newCenter.y}) from (${schematicGroup.center?.x}, ${schematicGroup.center?.y})`,
         )
 
-        const groupComponents = db.schematic_component.list({
-          schematic_group_id: schematicGroup.schematic_group_id,
+        const groupComponents = getGroupSubtreeSchematicComponents({
+          treeNode,
+          db,
+          schematicSheetId: opts.schematicSheetId,
         })
 
         debug(
@@ -1139,6 +1223,45 @@ export function applySchematicMatchPackLayoutToTree<
               deltaX: positionDelta.x,
               deltaY: positionDelta.y,
             })
+          }
+        }
+
+        const movedComponentIds = new Set(
+          groupComponents.map((c) => c.schematic_component_id),
+        )
+        const descendantInstancesBySourceGroupId = new Map<string, Group<any>>()
+        for (const desc of group.getDescendants()) {
+          if ((desc as any).source_group_id) {
+            descendantInstancesBySourceGroupId.set(
+              (desc as any).source_group_id,
+              desc as Group<any>,
+            )
+          }
+        }
+        for (const descSourceGroupId of getDescendantGroupSourceIds(treeNode)) {
+          const descSchematicGroup = db.schematic_group?.getWhere?.({
+            source_group_id: descSourceGroupId,
+          })
+          if (!descSchematicGroup) continue
+          const descDirectComponents = db.schematic_component.list({
+            schematic_group_id: descSchematicGroup.schematic_group_id,
+          })
+          const allDirectComponentsMoved = descDirectComponents.every((c) =>
+            movedComponentIds.has(c.schematic_component_id),
+          )
+          if (!allDirectComponentsMoved) continue
+
+          if (descSchematicGroup.center) {
+            descSchematicGroup.center = {
+              x: descSchematicGroup.center.x + positionDelta.x,
+              y: descSchematicGroup.center.y + positionDelta.y,
+            }
+          }
+          const descInstance =
+            descendantInstancesBySourceGroupId.get(descSourceGroupId)
+          if (descInstance?._schematicBorderBox) {
+            descInstance._schematicBorderBox.x += positionDelta.x
+            descInstance._schematicBorderBox.y += positionDelta.y
           }
         }
 
